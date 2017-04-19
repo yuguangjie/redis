@@ -858,7 +858,7 @@ struct clusterState;
 
 typedef struct {
     client *c;
-    int used;
+    int init;
     sds host;
     int port;
     long long timeout;
