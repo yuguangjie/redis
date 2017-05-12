@@ -1,8 +1,60 @@
 #include "server.h"
 
-static int
-dbAsyncDelete(redisDb *db, robj *key) {
-    return dbDelete(db, key);
+/* ============================ Worker Thread for Lazy Release ============================= */
+
+typedef struct {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    list *objs;
+} lazyReleaseWorker;
+
+static void *
+lazyReleaseWorkerMain(void *args) {
+    lazyReleaseWorker *p = args;
+    while (1) {
+        pthread_mutex_lock(&p->mutex);
+        while (listLength(p->objs) == 0) {
+            pthread_cond_wait(&p->cond, &p->mutex);
+        }
+        listNode *head = listFirst(p->objs);
+        robj *o = listNodeValue(head);
+        listDelNode(p->objs, head);
+        pthread_mutex_unlock(&p->mutex);
+
+        decrRefCount(o);
+    }
+    return NULL;
+}
+
+static void
+lazyReleaseObject(robj *o) {
+    serverAssert(o->refcount == 1);
+    lazyReleaseWorker *p = server.lazy_release_worker;
+    pthread_mutex_lock(&p->mutex);
+    if (listLength(p->objs) == 0) {
+        pthread_cond_broadcast(&p->cond);
+    }
+    listAddNodeTail(p->objs, o);
+    pthread_mutex_unlock(&p->mutex);
+}
+
+static lazyReleaseWorker *
+createLazyReleaseWorkerThread() {
+    lazyReleaseWorker *p = zmalloc(sizeof(lazyReleaseWorker));
+    pthread_mutex_init(&p->mutex, NULL);
+    pthread_cond_init(&p->cond, NULL);
+    p->objs = listCreate();
+    if (pthread_create(&p->thread, NULL, lazyReleaseWorkerMain, p) != 0) {
+        serverLog(LL_WARNING,"Fatal: Can't initialize Worker Thread for Lazy Release Jobs.");
+        exit(1);
+    }
+    return p;
+}
+
+void
+initLazyReleaseWorkerThread() {
+    server.lazy_release_worker = createLazyReleaseWorkerThread();
 }
 
 /* ============================ Iterators: singleObjectIterator ============================ */
@@ -1212,7 +1264,7 @@ restoreAsyncSelectCommand(client *c) {
 /* RESTORE-ASYNC delete $key */
 static int
 restoreAsyncHandleOrReplyDeleteKey(client *c, robj *key) {
-    if (dbAsyncDelete(c->db, key)) {
+    if (dbDelete(c->db, key)) {
         signalModifiedKey(c->db, key);
         server.dirty ++;
     }
@@ -1643,7 +1695,7 @@ restoreAsyncAckHandle(client *c) {
             listNode *head = listFirst(ll);
             robj *key = listNodeValue(head);
 
-            if (dbAsyncDelete(c->db, key)) {
+            if (dbDelete(c->db, key)) {
                 signalModifiedKey(c->db, key);
                 server.dirty ++;
             }

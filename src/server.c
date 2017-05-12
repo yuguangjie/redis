@@ -1912,6 +1912,7 @@ void initServer(void) {
         asyncMigrationClient *ac = server.async_migration_clients + j;
         memset(ac, 0, sizeof(*ac));
     }
+    initLazyReleaseWorkerThread();
 
     /* Open the TCP listening socket for the user commands. */
     if (server.port != 0 &&

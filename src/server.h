@@ -758,6 +758,7 @@ struct redisServer {
     mstime_t clients_pause_end_time; /* Time when we undo clients_paused */
     char neterr[ANET_ERR_LEN];   /* Error buffer for anet.c */
     asyncMigrationClient *async_migration_clients; /* MIGARTE-ASYNC cached clients */
+    void *lazy_release_worker;
     dict *migrate_cached_sockets;/* MIGRATE cached sockets */
     uint64_t next_client_id;    /* Next client unique ID. Incremental. */
     int protected_mode;         /* Don't accept external connections. */
@@ -1499,6 +1500,7 @@ uint64_t redisBuildId(void);
 void cleanupClientsForAsyncMigration();
 void releaseClientFromAsyncMigration(client *c);
 void unblockClientFromAsyncMigration(client *c);
+void initLazyReleaseWorkerThread();
 
 /* Commands prototypes */
 void authCommand(client *c);
