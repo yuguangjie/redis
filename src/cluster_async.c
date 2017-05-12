@@ -592,15 +592,15 @@ batchedObjectIteratorNext(client *c, batchedObjectIterator *it) {
 
 static int
 batchedObjectIteratorContains(batchedObjectIterator *it, robj *key) {
-    return dictFind(it->keys, key->ptr) != NULL;
+    return dictFind(it->keys, key) != NULL;
 }
 
 static int
 batchedObjectIteratorAddKey(redisDb *db, batchedObjectIterator *it, robj *key) {
-    if (batchedObjectIteratorContains(it, key)) {
+    if (dictAdd(it->keys, key, NULL) != C_OK) {
         return 0;
     }
-    dictAdd(it->keys, sdsdup(key->ptr), NULL);
+    incrRefCount(key);
 
     listAddNodeTail(it->iterator_list, createSingleObjectIterator(key));
     it->estimated_msgs += estimateNumberOfRestoreCommands(db, key, it->maxbulks);
