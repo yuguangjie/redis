@@ -296,7 +296,16 @@ struct redisCommand redisCommandTable[] = {
     {"pfdebug",pfdebugCommand,-3,"w",0,NULL,0,0,0,0,0},
     {"post",securityWarningCommand,-1,"lt",0,NULL,0,0,0,0,0},
     {"host:",securityWarningCommand,-1,"lt",0,NULL,0,0,0,0,0},
-    {"latency",latencyCommand,-2,"aslt",0,NULL,0,0,0,0,0}
+    {"latency",latencyCommand,-2,"aslt",0,NULL,0,0,0,0,0},
+    {"migrate-async",migrateAsyncCommand,-7,"ws",0,NULL,6,-1,1,0,0},
+    {"migrate-async-dump",migrateAsyncDumpCommand,-4,"rm",0,NULL,0,0,0,0,0},
+    {"migrate-async-fence",migrateAsyncFenceCommand,1,"rs",0,NULL,0,0,0,0,0},
+    {"migrate-async-cancel",migrateAsyncCancelCommand,1,"F",0,NULL,0,0,0,0,0},
+    {"migrate-async-status",migrateAsyncStatusCommand,1,"F",0,NULL,0,0,0,0,0},
+    {"restore-async",restoreAsyncCommand,-2,"wmk",0,NULL,2,2,1,0,0},
+    {"restore-async-auth",restoreAsyncAuthCommand,2,"sltF",0,NULL,0,0,0,0,0},
+    {"restore-async-select",restoreAsyncSelectCommand,2,"lF",0,NULL,0,0,0,0,0},
+    {"restore-async-ack",restoreAsyncAckCommand,3,"w",0,NULL,0,0,0,0,0},
 };
 
 struct evictionPoolEntry *evictionPoolAlloc(void);
@@ -1288,6 +1297,11 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         migrateCloseTimedoutSockets();
     }
 
+    /* Cleanup expired MIGRATE-ASYNC cached clients. */
+    run_with_period(1000) {
+        cleanupClientsForAsyncMigration();
+    }
+
     /* Start a scheduled BGSAVE if the corresponding flag is set. This is
      * useful when we are forced to postpone a BGSAVE because an AOF
      * rewrite is in progress.
@@ -1892,6 +1906,12 @@ void initServer(void) {
     server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
 
+    server.async_migration_clients = zmalloc(sizeof(asyncMigrationClient) * server.dbnum);
+    for (j = 0; j < server.dbnum; j ++) {
+        asyncMigrationClient *ac = server.async_migration_clients + j;
+        memset(ac, 0, sizeof(*ac));
+    }
+
     /* Open the TCP listening socket for the user commands. */
     if (server.port != 0 &&
         listenToPort(server.port,server.ipfd,&server.ipfd_count) == C_ERR)
@@ -2379,7 +2399,9 @@ int processCommand(client *c) {
     }
 
     /* Check if the user is authenticated */
-    if (server.requirepass && !c->authenticated && c->cmd->proc != authCommand)
+    if (server.requirepass && !c->authenticated
+            && c->cmd->proc != authCommand
+            && c->cmd->proc != restoreAsyncAuthCommand)
     {
         flagTransaction(c);
         addReply(c,shared.noautherr);
@@ -2390,13 +2412,13 @@ int processCommand(client *c) {
      * However we don't perform the redirection if:
      * 1) The sender of this command is our master.
      * 2) The command has no key arguments. */
-    if (server.cluster_enabled &&
+    int check_keys =
         !(c->flags & CLIENT_MASTER) &&
         !(c->flags & CLIENT_LUA &&
           server.lua_caller->flags & CLIENT_MASTER) &&
         !(c->cmd->getkeys_proc == NULL && c->cmd->firstkey == 0 &&
-          c->cmd->proc != execCommand))
-    {
+          c->cmd->proc != execCommand);
+    if (check_keys && server.cluster_enabled) {
         int hashslot;
         int error_code;
         clusterNode *n = getNodeByQuery(c,c->cmd,c->argv,c->argc,
@@ -2408,6 +2430,19 @@ int processCommand(client *c) {
                 flagTransaction(c);
             }
             clusterRedirectClient(c,n,hashslot,error_code);
+            return C_OK;
+        }
+    }
+
+    /* If there's a write/migrate conflict. */
+    if (check_keys) {
+        if (inConflictWithAsyncMigration(c, c->cmd, c->argv, c->argc)) {
+            if (c->cmd->proc == execCommand) {
+                discardTransaction(c);
+            } else {
+                flagTransaction(c);
+            }
+            addReplySds(c,sdsnew("-TRYAGAIN The specific keys are being migrated (async)\r\n"));
             return C_OK;
         }
     }

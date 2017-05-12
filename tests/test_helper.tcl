@@ -54,6 +54,7 @@ set ::all_tests {
     unit/geo
     unit/memefficiency
     unit/hyperloglog
+    unit/migrate-async
 }
 # Index to the next test to run in the ::all_tests list.
 set ::next_test 0

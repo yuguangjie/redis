@@ -272,12 +272,14 @@ typedef long long mstime_t; /* millisecond time type. */
 #define CLIENT_REPLY_SKIP (1<<24)  /* Don't send just this reply. */
 #define CLIENT_LUA_DEBUG (1<<25)  /* Run EVAL in debug mode. */
 #define CLIENT_LUA_DEBUG_SYNC (1<<26)  /* EVAL debugging without fork() */
+#define CLIENT_ASYNC_MIGRATION (1<<27) /* This client is an asynchronous migration connection. */
 
 /* Client block type (btype field in client structure)
  * if CLIENT_BLOCKED flag is set. */
 #define BLOCKED_NONE 0    /* Not blocked, no CLIENT_BLOCKED flag set. */
 #define BLOCKED_LIST 1    /* BLPOP & co. */
 #define BLOCKED_WAIT 2    /* WAIT for synchronous replication. */
+#define BLOCKED_ASYNC_MIGRATION 3 /* Blocked by asynchronous migration. */
 
 /* Client request types */
 #define PROTO_REQ_INLINE 1
@@ -610,6 +612,8 @@ typedef struct client {
     list *pubsub_patterns;  /* patterns a client is interested in (SUBSCRIBE) */
     sds peerid;             /* Cached peer ID. */
 
+    list *migration_waitq;  /* wait queue that client is blocking in */
+
     /* Response buffer */
     int bufpos;
     char buf[PROTO_REPLY_CHUNK_BYTES];
@@ -701,6 +705,18 @@ struct clusterState;
 #undef hz
 #endif
 
+typedef struct {
+    client *c;                  /* Client for data migration. */
+    int init;                   /* If client has been authenticated. */
+    sds host;                   /* Target host & port. */
+    int port;
+    long long timeout;          /* Client timeout in milliseconds. */
+    long long lastuse;          /* Timestamp of the last operation, used for timeout, in milliseconds. */
+    long sending_msgs;          /* Number of commands buffered in sending window. */
+    list *bclients;             /* Clients blocked by data migration */
+    void *iterator;             /* Pointer to the batchedObjectIterator that is being migrated. */
+} asyncMigrationClient;
+
 struct redisServer {
     /* General */
     pid_t pid;                  /* Main process pid. */
@@ -741,6 +757,7 @@ struct redisServer {
     int clients_paused;         /* True if clients are currently paused */
     mstime_t clients_pause_end_time; /* Time when we undo clients_paused */
     char neterr[ANET_ERR_LEN];   /* Error buffer for anet.c */
+    asyncMigrationClient *async_migration_clients; /* MIGARTE-ASYNC cached clients */
     dict *migrate_cached_sockets;/* MIGRATE cached sockets */
     uint64_t next_client_id;    /* Next client unique ID. Incremental. */
     int protected_mode;         /* Don't accept external connections. */
@@ -1475,6 +1492,11 @@ char *redisGitSHA1(void);
 char *redisGitDirty(void);
 uint64_t redisBuildId(void);
 
+/* Asynchronous Migration */
+void cleanupClientsForAsyncMigration();
+void releaseClientFromAsyncMigration(client *c);
+void unblockClientFromAsyncMigration(client *c);
+
 /* Commands prototypes */
 void authCommand(client *c);
 void pingCommand(client *c);
@@ -1646,6 +1668,16 @@ void pfmergeCommand(client *c);
 void pfdebugCommand(client *c);
 void latencyCommand(client *c);
 void securityWarningCommand(client *c);
+
+void migrateAsyncCommand(client *c);
+void migrateAsyncDumpCommand(client *c);
+void migrateAsyncFenceCommand(client *c);
+void migrateAsyncStatusCommand(client *c);
+void migrateAsyncCancelCommand(client *c);
+void restoreAsyncCommand(client *c);
+void restoreAsyncAuthCommand(client *c);
+void restoreAsyncSelectCommand(client *c);
+void restoreAsyncAckCommand(client *c);
 
 #if defined(__GNUC__)
 void *calloc(size_t count, size_t size) __attribute__ ((deprecated));

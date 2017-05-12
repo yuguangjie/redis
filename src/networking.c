@@ -123,6 +123,7 @@ client *createClient(int fd) {
     c->pubsub_channels = dictCreate(&setDictType,NULL);
     c->pubsub_patterns = listCreate();
     c->peerid = NULL;
+    c->migration_waitq = NULL;
     listSetFreeMethod(c->pubsub_patterns,decrRefCountVoid);
     listSetMatchMethod(c->pubsub_patterns,listMatchObjects);
     if (fd != -1) listAddNodeTail(server.clients,c);
@@ -807,6 +808,10 @@ void freeClient(client *c) {
     if ((c->flags & CLIENT_SLAVE) && !(c->flags & CLIENT_MONITOR)) {
         serverLog(LL_WARNING,"Connection with slave %s lost.",
             replicationGetSlaveName(c));
+    }
+
+    if (c->flags & CLIENT_ASYNC_MIGRATION) {
+        releaseClientFromAsyncMigration(c);
     }
 
     /* Free the query buffer */
@@ -1793,6 +1798,11 @@ char *getClientTypeName(int class) {
 int checkClientOutputBufferLimits(client *c) {
     int soft = 0, hard = 0, class;
     unsigned long used_mem = getClientOutputBufferMemoryUsage(c);
+
+    /* Just ignore the output buffer limits if client is used asynchronous migration. */
+    if (c->flags & CLIENT_ASYNC_MIGRATION) {
+        return 0;
+    }
 
     class = getClientType(c);
     /* For the purpose of output buffer limiting, masters are handled

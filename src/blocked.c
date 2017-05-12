@@ -136,6 +136,8 @@ void unblockClient(client *c) {
         unblockClientWaitingData(c);
     } else if (c->btype == BLOCKED_WAIT) {
         unblockClientWaitingReplicas(c);
+    } else if (c->btype == BLOCKED_ASYNC_MIGRATION) {
+        unblockClientFromAsyncMigration(c);
     } else {
         serverPanic("Unknown btype in unblockClient().");
     }
