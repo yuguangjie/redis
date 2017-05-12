@@ -1259,12 +1259,41 @@ restoreAsyncSelectCommand(client *c) {
     }
 }
 
+#define LAZY_RELEASE_THRESHOLD 256
+
+static long estimateNumberOfRestoreCommandsObject(robj *val, long long maxbulks);
+
+static int
+dbAsyncDelete(redisDb *db, robj *key) {
+    robj *o = lookupKeyWrite(db, key);
+    if (o == NULL) {
+        return 0;
+    }
+    incrRefCount(o);
+
+    int ret = dbDelete(db, key);
+
+    if (o->refcount != 1) {
+        goto fallback;
+    }
+    if (estimateNumberOfRestoreCommandsObject(o, LAZY_RELEASE_THRESHOLD) == 1) {
+        goto fallback;
+    }
+
+    lazyReleaseObject(o);
+    return ret;
+
+fallback:
+    decrRefCount(o);
+    return ret;
+}
+
 /* ============================ Command: RESTORE-ASYNC ===================================== */
 
 /* RESTORE-ASYNC delete $key */
 static int
 restoreAsyncHandleOrReplyDeleteKey(client *c, robj *key) {
-    if (dbDelete(c->db, key)) {
+    if (dbAsyncDelete(c->db, key)) {
         signalModifiedKey(c->db, key);
         server.dirty ++;
     }
@@ -1695,7 +1724,7 @@ restoreAsyncAckHandle(client *c) {
             listNode *head = listFirst(ll);
             robj *key = listNodeValue(head);
 
-            if (dbDelete(c->db, key)) {
+            if (dbAsyncDelete(c->db, key)) {
                 signalModifiedKey(c->db, key);
                 server.dirty ++;
             }
