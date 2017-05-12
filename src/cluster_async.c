@@ -676,8 +676,7 @@ batchedObjectIteratorStatus(client *c, batchedObjectIterator *it) {
         dictIterator *di = dictGetIterator(it->keys);
         dictEntry *de;
         while((de = dictNext(di)) != NULL) {
-            sds s = dictGetKey(de);
-            addReplyBulkCBuffer(c, s, sdslen(s));
+            addReplyBulk(c, dictGetKey(de));
         }
         dictReleaseIterator(di);
     } while (0);
