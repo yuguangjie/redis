@@ -1,5 +1,10 @@
 #include "server.h"
 
+static int
+dbAsyncDelete(redisDb *db, robj *key) {
+    return dbDelete(db, key);
+}
+
 /* ============================ Iterators: singleObjectIterator ============================ */
 
 #define STAGE_PREPARE 0
@@ -63,21 +68,21 @@ singleObjectIteratorScanCallback(void *data, const dictEntry *de) {
     robj *o = pd[1];
     long long *n = pd[2];
 
-    sds s[2] = {NULL, NULL};
+    robj *objs[2] = {NULL, NULL};
     switch (o->type) {
     case OBJ_HASH:
-        s[0] = dictGetKey(de);
-        s[1] = dictGetVal(de);
+        objs[0] = dictGetKey(de);
+        objs[1] = dictGetVal(de);
         break;
     case OBJ_SET:
-        s[0] = dictGetKey(de);
+        objs[0] = dictGetKey(de);
         break;
     }
     for (int i = 0; i < 2; i ++) {
-        if (s[i] != NULL) {
-            robj *obj = createStringObject((const char *)s[i], sdslen(s[i]));
-            *n += sdslenOrElse(obj, 8);
-            listAddNodeTail(l, obj);
+        if (objs[i] != NULL) {
+            incrRefCount(objs[i]);
+            *n += sdslenOrElse(objs[i], 8);
+            listAddNodeTail(l, objs[i]);
         }
     }
 }
@@ -336,7 +341,8 @@ singleObjectIteratorNextStageChunkedTypeZSet(singleObjectIterator *it,
 
     do {
         if (node != NULL) {
-            robj *field = createStringObject((const char *)node->ele, sdslen(node->ele));
+            robj *field = node->obj;
+            incrRefCount(field);
             nn += sdslenOrElse(field, 8);
             listAddNodeTail(l, field);
 
@@ -372,7 +378,7 @@ singleObjectIteratorNextStageChunkedTypeHashOrDict(singleObjectIterator *it,
     void *pd[] = {l, o, &nn};
 
     do {
-        it->cursor = dictScan(ht, it->cursor, singleObjectIteratorScanCallback, NULL, pd);
+        it->cursor = dictScan(ht, it->cursor, singleObjectIteratorScanCallback, pd);
         if (it->cursor == 0) {
             done = 1;
         }
@@ -404,7 +410,7 @@ singleObjectIteratorNextStageChunked(client *c, singleObjectIterator *it,
     case OBJ_ZSET:
         type = "zset"; break;
     default:
-        serverPanic("unknown object type = %d", val->type);
+        serverPanic("unknown object type");
     }
 
     list *ll = listCreate();
@@ -478,7 +484,7 @@ singleObjectIteratorNext(client *c, singleObjectIterator *it,
     case STAGE_DONE:
         return 0;
     default:
-        serverPanic("invalid stage=%d of singleObjectIterator", it->stage);
+        serverPanic("invalid stage of singleObjectIterator");
     }
 }
 
@@ -1297,6 +1303,7 @@ restoreAsyncHandleOrReplyTypeList(client *c, robj *key, int argc, robj **argv) {
     }
 
     for (int i = 0; i < argc; i ++) {
+        argv[i] = tryObjectEncoding(argv[i]);
         listTypePush(val, argv[i], LIST_TAIL);
     }
     return C_OK;
@@ -1326,7 +1333,8 @@ restoreAsyncHandleOrReplyTypeHash(client *c, robj *key, int argc, robj **argv, l
     }
 
     for (int i = 0; i < argc; i += 2) {
-        hashTypeSet(val, argv[i]->ptr, argv[i+1]->ptr, HASH_SET_COPY);
+        hashTypeTryObjectEncoding(val, &argv[i], &argv[i + 1]);
+        hashTypeSet(val, argv[i], argv[i + 1]);
     }
     return C_OK;
 }
@@ -1355,7 +1363,8 @@ restoreAsyncHandleOrReplyTypeDict(client *c, robj *key, int argc, robj **argv, l
     }
 
     for (int i = 0; i < argc; i ++) {
-        setTypeAdd(val, argv[i]->ptr);
+        argv[i] = tryObjectEncoding(argv[i]);
+        setTypeAdd(val, argv[i]);
     }
     return C_OK;
 }
@@ -1391,15 +1400,24 @@ restoreAsyncHandleOrReplyTypeZSet(client *c, robj *key, int argc, robj **argv, l
         dbAdd(c->db, key, val);
     }
 
+    zset *zs = val->ptr;
     if (size != 0) {
-        zset *zs = val->ptr;
         dict *ht = zs->dict;
         dictExpand(ht, size);
     }
 
     for (int i = 0, j = 0; i < argc; i += 2, j ++) {
-        int flags = ZADD_NONE;
-        zsetAdd(val, scores[j], argv[i]->ptr, &flags, NULL);
+        robj *field = argv[i] = tryObjectEncoding(argv[i]);
+        dictEntry *de = dictFind(zs->dict, field);
+        if (de != NULL) {
+            double score = *(double *)dictGetVal(de);
+            zslDelete(zs->zsl, score, field);
+            dictDelete(zs->dict, field);
+        }
+        zskiplistNode *znode = zslInsert(zs->zsl, scores[j], field);
+        incrRefCount(field);
+        dictAdd(zs->dict, field, &(znode->score));
+        incrRefCount(field);
     }
     zfree(scores);
     return C_OK;
@@ -1548,7 +1566,7 @@ restoreAsyncCommand(client *c) {
 
 success_common_ttlms:
     if (ttlms != 0) {
-        setExpire(c, c->db, key, mstime() + ttlms);
+        setExpire(c->db, key, mstime() + ttlms);
     } else {
         removeExpire(c->db, key);
     }
