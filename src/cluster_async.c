@@ -57,6 +57,36 @@ initLazyReleaseWorkerThread() {
     server.lazy_release_worker = createLazyReleaseWorkerThread();
 }
 
+static long estimateNumberOfRestoreCommandsObject(robj *val, long long maxbulks);
+
+static int
+dbAsyncDelete(redisDb *db, robj *key) {
+    robj *o = lookupKeyWrite(db, key);
+    if (o == NULL) {
+        return 0;
+    }
+    incrRefCount(o);
+
+    const int threshold = 200;
+
+    int ret = dbDelete(db, key);
+
+    if (o->refcount != 1) {
+        goto sync_release;
+    }
+    if (estimateNumberOfRestoreCommandsObject(o, threshold) != 1) {
+        goto lazy_release;
+    }
+
+sync_release:
+    decrRefCount(o);
+    return ret;
+
+lazy_release:
+    lazyReleaseObject(o);
+    return ret;
+}
+
 /* ============================ Iterators: singleObjectIterator ============================ */
 
 #define STAGE_PREPARE 0
@@ -1258,35 +1288,6 @@ restoreAsyncSelectCommand(client *c) {
     }
 }
 
-#define LAZY_RELEASE_THRESHOLD 256
-
-static long estimateNumberOfRestoreCommandsObject(robj *val, long long maxbulks);
-
-static int
-dbAsyncDelete(redisDb *db, robj *key) {
-    robj *o = lookupKeyWrite(db, key);
-    if (o == NULL) {
-        return 0;
-    }
-    incrRefCount(o);
-
-    int ret = dbDelete(db, key);
-
-    if (o->refcount != 1) {
-        goto fallback;
-    }
-    if (estimateNumberOfRestoreCommandsObject(o, LAZY_RELEASE_THRESHOLD) == 1) {
-        goto fallback;
-    }
-
-    lazyReleaseObject(o);
-    return ret;
-
-fallback:
-    decrRefCount(o);
-    return ret;
-}
-
 /* ============================ Command: RESTORE-ASYNC ===================================== */
 
 /* RESTORE-ASYNC delete $key */
@@ -1494,9 +1495,9 @@ restoreAsyncHandleOrReplyTypeZSet(client *c, robj *key, int argc, robj **argv, l
             zslDelete(zs->zsl, score, field);
             dictDelete(zs->dict, field);
         }
-        zskiplistNode *znode = zslInsert(zs->zsl, scores[j], field);
+        zskiplistNode *zn = zslInsert(zs->zsl, scores[j], field);
         incrRefCount(field);
-        dictAdd(zs->dict, field, &(znode->score));
+        dictAdd(zs->dict, field, &(zn->score));
         incrRefCount(field);
     }
     zfree(scores);
